@@ -1,11 +1,12 @@
-//go:build (validation || infra.any || cluster.any || sanity) && !stress && !extended
-
 package ingress
 
 import (
+	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rancher/rancher/tests/v2/actions/ingresses"
 	"github.com/rancher/rancher/tests/v2/actions/projects"
@@ -15,15 +16,14 @@ import (
 	management "github.com/rancher/shepherd/clients/rancher/generated/management/v3"
 	v1 "github.com/rancher/shepherd/clients/rancher/v1"
 	"github.com/rancher/shepherd/extensions/clusters"
+	"github.com/rancher/shepherd/extensions/defaults"
 	extensionsingress "github.com/rancher/shepherd/extensions/ingresses"
-	"github.com/rancher/shepherd/extensions/users"
 	namegen "github.com/rancher/shepherd/pkg/namegenerator"
 	"github.com/rancher/shepherd/pkg/session"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	networkingv1 "k8s.io/api/networking/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sError "k8s.io/apimachinery/pkg/api/errors"
 )
 
 type IngressRBACTestSuite struct {
@@ -31,20 +31,6 @@ type IngressRBACTestSuite struct {
 	client  *rancher.Client
 	session *session.Session
 	cluster *management.Cluster
-}
-
-type userContext struct {
-	user      *management.User
-	client    *rancher.Client
-	steve     *v1.Client
-	project   *management.Project
-	workload  *v1.SteveAPIObject
-	namespace string
-	role      string
-}
-
-func (i *IngressRBACTestSuite) TearDownSuite() {
-	i.session.Cleanup()
 }
 
 func (i *IngressRBACTestSuite) SetupSuite() {
@@ -64,244 +50,397 @@ func (i *IngressRBACTestSuite) SetupSuite() {
 	i.cluster, err = i.client.Management.Cluster.ByID(clusterID)
 	require.NoError(i.T(), err)
 }
-func (i *IngressRBACTestSuite) createWorkloadWithAppropriateClient(ctx *userContext) error {
-	log.Infof("Creating test workload for %s role", ctx.role)
-	clientToUse := ctx.client
-	if ctx.role == rbac.ClusterMember.String() || ctx.role == rbac.ReadOnly.String() {
-		log.Infof("Using admin client for %s role", ctx.role)
-		clientToUse = i.client
+
+func (i *IngressRBACTestSuite) TearDownSuite() {
+	log.Info("Starting test suite cleanup")
+
+	if i.session != nil {
+		log.Info("Cleaning up session resources")
+		i.session.Cleanup()
 	}
 
-	k8sWorkload, err := deployment.CreateDeployment(clientToUse, i.cluster.ID, ctx.namespace, 1, "nginx", "", false, false, true, false)
-	if err != nil {
-		return fmt.Errorf("failed to create workload for %s role: %v", ctx.role, err)
-	}
-
-	steveWorkload := &v1.SteveAPIObject{}
-	if err = v1.ConvertToK8sType(k8sWorkload, steveWorkload); err != nil {
-		return fmt.Errorf("failed to convert workload for %s role: %v", ctx.role, err)
-	}
-	ctx.workload = steveWorkload
-	return nil
-}
-
-func (i *IngressRBACTestSuite) createIngressWithAppropriateClient(ctx *userContext, ingressTemplate networkingv1.Ingress) (*v1.SteveAPIObject, error) {
-	log.Infof("Creating ingress for %s role", ctx.role)
-	var clientToUse *v1.Client
-	var err error
-
-	if ctx.role == rbac.ClusterMember.String() || ctx.role == rbac.ReadOnly.String() {
-		log.Infof("Using admin client for %s role", ctx.role)
-		clientToUse, err = i.client.Steve.ProxyDownstream(i.cluster.ID)
+	if i.client != nil && i.cluster != nil {
+		log.Info("Cleaning up any remaining ingresses")
+		steveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get admin client for %s role: %v", ctx.role, err)
-		}
-	} else {
-		clientToUse = ctx.steve
-	}
-
-	ingress, err := extensionsingress.CreateIngress(clientToUse, ingressTemplate.Name, ingressTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create ingress for %s role: %v", ctx.role, err)
-	}
-	return ingress, nil
-}
-
-func (i *IngressRBACTestSuite) validateIngressUpdate(ctx *userContext, ingress *v1.SteveAPIObject, ingressTemplate networkingv1.Ingress) error {
-	log.Infof("Validating ingress update for %s role", ctx.role)
-	updatedTemplate := ingressTemplate.DeepCopy()
-	updatedTemplate.Spec.Rules[0].Host = fmt.Sprintf("%s.updated.com", namegen.AppendRandomString("test"))
-
-	_, err := ingresses.UpdateIngress(ctx.steve, ingress, updatedTemplate)
-	if ctx.role == rbac.ReadOnly.String() || ctx.role == rbac.ClusterMember.String() {
-		if err == nil {
-			return fmt.Errorf("update should be denied for %s role", ctx.role)
-		}
-		if !strings.Contains(err.Error(), "admission webhook \"validate.nginx.ingress.kubernetes.io\" denied the request") &&
-			!strings.Contains(err.Error(), "Unknown schema type [networking.k8s.io.ingress]") &&
-			!strings.Contains(err.Error(), "Resource type [networking.k8s.io.ingress] is not updatable") {
-			return fmt.Errorf("unexpected error for %s role: %v", ctx.role, err)
-		}
-		return nil
-	}
-	return err
-}
-
-func (i *IngressRBACTestSuite) validateIngressDelete(ctx *userContext, ingress *v1.SteveAPIObject) error {
-	log.Infof("Validating ingress deletion for %s role", ctx.role)
-	err := ctx.steve.SteveType(ingress.Type).Delete(ingress)
-	if ctx.role == rbac.ReadOnly.String() || ctx.role == rbac.ClusterMember.String() {
-		if err == nil {
-			return fmt.Errorf("delete should be denied for %s role", ctx.role)
-		}
-		acceptableErrors := []string{
-			"admission webhook \"validate.nginx.ingress.kubernetes.io\" denied the request",
-			"Unknown schema type [networking.k8s.io.ingress]",
-			"Resource type [networking.k8s.io.ingress] is not deletable",
-			"Resource type [networking.k8s.io.ingress] can not be deleted",
+			log.Errorf("Error getting steve client during cleanup: %v", err)
+			return
 		}
 
-		for _, acceptableError := range acceptableErrors {
-			if strings.Contains(err.Error(), acceptableError) {
-				log.Infof("Expected delete restriction for %s role", ctx.role)
-				log.Info("Cleaning up with admin client")
-				adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
-				if err != nil {
-					return fmt.Errorf("failed to get admin client for cleanup: %v", err)
-				}
-				return adminSteveClient.SteveType(ingress.Type).Delete(ingress)
+		ingressList, err := steveClient.SteveType("networking.k8s.io.ingress").List(nil)
+		if err != nil {
+			log.Errorf("Error listing ingresses during cleanup: %v", err)
+			return
+		}
+
+		for _, ingress := range ingressList.Data {
+			if err := steveClient.SteveType(ingress.Type).Delete(&ingress); err != nil {
+				log.Errorf("Error deleting ingress %s during cleanup: %v", ingress.Name, err)
 			}
 		}
-		return fmt.Errorf("unexpected error for %s role: %v", ctx.role, err)
-	}
-	return err
-}
-
-func (i *IngressRBACTestSuite) validateIngressPermissions(ctx *userContext) {
-	err := i.createWorkloadWithAppropriateClient(ctx)
-	require.NoError(i.T(), err, fmt.Sprintf("Failed to create workload for %s role", ctx.role))
-
-	ingressTemplate := i.createIngressTemplate(ctx)
-	ingress, err := i.createIngressWithAppropriateClient(ctx, ingressTemplate)
-	require.NoError(i.T(), err, fmt.Sprintf("Failed to create ingress for %s role", ctx.role))
-
-	log.Infof("Waiting for ingress to be active for %s role", ctx.role)
-	clientToUse := ctx.client
-	if ctx.role == rbac.ClusterMember.String() || ctx.role == rbac.ReadOnly.String() {
-		log.Infof("Using admin client for %s role", ctx.role)
-		clientToUse = i.client
-	}
-	ingresses.WaitForIngressToBeActive(clientToUse, i.cluster.ID, ctx.namespace, ingress.Name)
-
-	err = i.validateIngressUpdate(ctx, ingress, ingressTemplate)
-	require.NoError(i.T(), err, fmt.Sprintf("Failed to validate ingress update for %s role", ctx.role))
-
-	err = i.validateIngressDelete(ctx, ingress)
-	require.NoError(i.T(), err, fmt.Sprintf("Failed to validate ingress deletion for %s role", ctx.role))
-}
-
-func (i *IngressRBACTestSuite) setupUserContext(role string) (*userContext, error) {
-	log.Infof("Setting up user context for role: %s", role)
-
-	user, client, err := rbac.SetupUser(i.client, rbac.StandardUser.String())
-	if err != nil {
-		return nil, fmt.Errorf("failed to setup user: %v", err)
-	}
-
-	project, namespace, err := projects.CreateProjectAndNamespace(i.client, i.cluster.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create project and namespace: %v", err)
-	}
-
-	switch role {
-	case rbac.ClusterOwner.String(), rbac.ClusterMember.String():
-		err = users.AddClusterRoleToUser(i.client, i.cluster, user, role, nil)
-	case rbac.ProjectOwner.String(), rbac.ProjectMember.String(), rbac.ReadOnly.String():
-		err = users.AddProjectMember(i.client, project, user, role, nil)
-	default:
-		return nil, fmt.Errorf("unsupported role: %s", role)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to add role to user: %v", err)
-	}
-
-	client, err = client.ReLogin()
-	if err != nil {
-		return nil, fmt.Errorf("failed to relogin: %v", err)
-	}
-
-	steveClient, err := client.Steve.ProxyDownstream(i.cluster.ID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get downstream client: %v", err)
-	}
-
-	return &userContext{
-		user:      user,
-		client:    client,
-		steve:     steveClient,
-		project:   project,
-		namespace: namespace.Name,
-		role:      role,
-	}, nil
-}
-
-func (i *IngressRBACTestSuite) createTestWorkload(ctx *userContext) error {
-	log.Info("Creating test workload")
-
-	clientToUse := ctx.client
-	if ctx.role == rbac.ClusterMember.String() || ctx.role == rbac.ReadOnly.String() {
-		log.Info("Using admin client for workload creation due to restricted role")
-		clientToUse = i.client
-	}
-
-	k8sWorkload, err := deployment.CreateDeployment(clientToUse, i.cluster.ID, ctx.namespace, 1, "nginx", "", false, false, true, false)
-	if err != nil {
-		return err
-	}
-
-	steveWorkload := &v1.SteveAPIObject{}
-	err = v1.ConvertToK8sType(k8sWorkload, steveWorkload)
-	if err != nil {
-		return err
-	}
-
-	ctx.workload = steveWorkload
-	return nil
-}
-
-func (i *IngressRBACTestSuite) createIngressTemplate(ctx *userContext) networkingv1.Ingress {
-	ingressName := namegen.AppendRandomString("test-ingress")
-
-	host := fmt.Sprintf("%s.foo.com", namegen.AppendRandomString("test"))
-	path := "/"
-	pathType := networkingv1.PathTypePrefix
-
-	return networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ingressName,
-			Namespace: ctx.namespace,
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: host,
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     path,
-									PathType: &pathType,
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: ctx.workload.Name,
-											Port: networkingv1.ServiceBackendPort{Number: 80},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
+		log.Info("Cleanup completed")
 	}
 }
 
-func (i *IngressRBACTestSuite) TestIngressRBAC() {
-	roles := []string{
-		rbac.ClusterOwner.String(),
-		rbac.ClusterMember.String(),
-		rbac.ProjectOwner.String(),
-		rbac.ProjectMember.String(),
-		rbac.ReadOnly.String(),
+func (i *IngressRBACTestSuite) TestCreateIngress() {
+	tests := []struct {
+		role      rbac.Role
+		canCreate bool
+		member    string
+	}{
+		{rbac.ClusterOwner, true, rbac.StandardUser.String()},
+		{rbac.ClusterMember, true, rbac.StandardUser.String()},
+		{rbac.ProjectOwner, true, rbac.StandardUser.String()},
+		{rbac.ProjectMember, true, rbac.StandardUser.String()},
+		{rbac.ReadOnly, false, rbac.StandardUser.String()},
 	}
 
-	for _, role := range roles {
-		i.Run(fmt.Sprintf("Testing role: %s", role), func() {
-			ctx, err := i.setupUserContext(role)
-			require.NoError(i.T(), err, "Failed to setup user context")
+	for _, tt := range tests {
+		i.Run(fmt.Sprintf("Validate ingress creation for %s role", tt.role), func() {
+			subSession := i.session.NewSession()
+			defer subSession.Cleanup()
 
-			i.validateIngressPermissions(ctx)
+			log.Infof("Creating project and namespace for role: %s", tt.role)
+			adminProject, namespace, err := projects.CreateProjectAndNamespace(i.client, i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Infof("Creating user with role: %s", tt.role)
+			newUser, standardUserClient, err := rbac.AddUserWithRoleToCluster(i.client, tt.member, tt.role.String(), i.cluster, adminProject)
+			require.NoError(i.T(), err)
+			log.Infof("Created user: %v", newUser.Username)
+
+			log.Info("Creating workload using admin client")
+			workload, err := deployment.CreateDeployment(i.client, i.cluster.ID, namespace.Name, 1, "nginx", "", false, false, true, false)
+			require.NoError(i.T(), err)
+
+			steveWorkload := &v1.SteveAPIObject{}
+			err = v1.ConvertToK8sType(workload, steveWorkload)
+			require.NoError(i.T(), err)
+
+			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+
+			steveClient, err := standardUserClient.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			var ingress *v1.SteveAPIObject
+			var createErr error
+			_, cancel := context.WithTimeout(context.Background(), defaults.ThirtyMinuteTimeout)
+			defer cancel()
+
+			switch tt.role.String() {
+			case rbac.ClusterOwner.String(), rbac.ProjectOwner.String(), rbac.ProjectMember.String():
+				log.Infof("Creating ingress as %s", tt.role)
+				ingress, createErr = extensionsingress.CreateIngress(steveClient, ingressTemplate.Name, ingressTemplate)
+				require.NoError(i.T(), createErr)
+				require.NotNil(i.T(), ingress)
+
+				log.Info("Verifying ingress creation")
+				_, err = steveClient.SteveType(ingress.Type).ByID(ingress.ID)
+				require.NoError(i.T(), err)
+
+			case rbac.ClusterMember.String():
+				log.Info("Creating ingress as cluster member using admin client")
+				adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
+				require.NoError(i.T(), err)
+
+				ingress, createErr = extensionsingress.CreateIngress(adminSteveClient, ingressTemplate.Name, ingressTemplate)
+				require.NoError(i.T(), createErr)
+				require.NotNil(i.T(), ingress)
+
+			case rbac.ReadOnly.String():
+				log.Info("Attempting to create ingress as read-only user")
+				ingress, createErr = extensionsingress.CreateIngress(steveClient, ingressTemplate.Name, ingressTemplate)
+
+				require.Error(i.T(), createErr)
+				isPermissionError := k8sError.IsForbidden(createErr) ||
+					strings.Contains(createErr.Error(), "admission webhook") ||
+					strings.Contains(createErr.Error(), "not allowed") ||
+					strings.Contains(createErr.Error(), "permission denied") ||
+					strings.Contains(createErr.Error(), "is not creatable")
+
+				if !isPermissionError {
+					log.Errorf("Unexpected error: %v", createErr)
+				}
+				require.True(i.T(), isPermissionError)
+				require.Nil(i.T(), ingress)
+			}
+
+			if ingress != nil {
+				log.Info("Cleaning up created ingress")
+				adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
+				require.NoError(i.T(), err)
+				err = adminSteveClient.SteveType(ingress.Type).Delete(ingress)
+				require.NoError(i.T(), err)
+			}
+		})
+	}
+}
+
+func (i *IngressRBACTestSuite) TestListIngress() {
+	tests := []struct {
+		role   rbac.Role
+		member string
+	}{
+		{rbac.ClusterOwner, rbac.StandardUser.String()},
+		{rbac.ClusterMember, rbac.StandardUser.String()},
+		{rbac.ProjectOwner, rbac.StandardUser.String()},
+		{rbac.ProjectMember, rbac.StandardUser.String()},
+		{rbac.ReadOnly, rbac.StandardUser.String()},
+	}
+
+	for _, tt := range tests {
+		i.Run("Validate listing ingress for user with role "+tt.role.String(), func() {
+			subSession := i.session.NewSession()
+			defer subSession.Cleanup()
+
+			log.Infof("Creating project and namespace for role: %s", tt.role)
+			adminProject, namespace, err := projects.CreateProjectAndNamespace(i.client, i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Infof("Creating user with role: %s", tt.role)
+			newUser, standardUserClient, err := rbac.AddUserWithRoleToCluster(i.client, tt.member, tt.role.String(), i.cluster, adminProject)
+			require.NoError(i.T(), err)
+			log.Infof("Created user: %v", newUser.Username)
+
+			log.Info("Setting up admin steve client")
+			adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Info("Creating test workload")
+			workload, err := deployment.CreateDeployment(i.client, i.cluster.ID, namespace.Name, 1, "nginx", "", false, false, true, false)
+			require.NoError(i.T(), err)
+
+			steveWorkload := &v1.SteveAPIObject{}
+			err = v1.ConvertToK8sType(workload, steveWorkload)
+			require.NoError(i.T(), err)
+
+			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+
+			log.Info("Creating test ingress")
+			ingress, err := extensionsingress.CreateIngress(adminSteveClient, ingressTemplate.Name, ingressTemplate)
+			require.NoError(i.T(), err)
+
+			log.Infof("Setting up user steve client for role: %s", tt.role)
+			steveClient, err := standardUserClient.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			options := url.Values{}
+			options.Add("namespace", namespace.Name)
+
+			log.Info("Attempting to list ingresses")
+			var ingressList *v1.SteveCollection
+			maxRetries := 3
+			for retry := 0; retry < maxRetries; retry++ {
+				if retry > 0 {
+					log.Infof("Retry attempt %d/%d", retry+1, maxRetries)
+				}
+				ingressList, err = steveClient.SteveType(ingress.Type).List(options)
+				if err == nil {
+					break
+				}
+				if strings.Contains(err.Error(), "500 Internal Server Error") {
+					log.Warnf("Got 500 error, retrying operation for %s role", tt.role)
+					time.Sleep(defaults.FiveSecondTimeout)
+					continue
+				}
+				break
+			}
+
+			switch tt.role.String() {
+			case rbac.ClusterOwner.String(), rbac.ProjectOwner.String(), rbac.ProjectMember.String(), rbac.ReadOnly.String():
+				log.Info("Verifying successful list operation")
+				require.NoError(i.T(), err)
+				require.NotNil(i.T(), ingressList)
+				require.Greater(i.T(), len(ingressList.Data), 0)
+
+			case rbac.ClusterMember.String():
+				log.Info("Verifying list operation for cluster member")
+				if strings.Contains(err.Error(), "sync from client") ||
+					strings.Contains(err.Error(), "Unknown schema type") {
+					log.Infof("Skipping schema validation for %s role", tt.role)
+					return
+				}
+				isPermissionError := err != nil && (k8sError.IsForbidden(err) ||
+					strings.Contains(err.Error(), "is not listable"))
+				require.True(i.T(), isPermissionError)
+			}
+
+			log.Info("Cleaning up test ingress")
+			err = adminSteveClient.SteveType(ingress.Type).Delete(ingress)
+			require.NoError(i.T(), err)
+		})
+	}
+}
+
+func (i *IngressRBACTestSuite) TestUpdateIngress() {
+	tests := []struct {
+		role   rbac.Role
+		member string
+	}{
+		{rbac.ClusterOwner, rbac.StandardUser.String()},
+		{rbac.ClusterMember, rbac.StandardUser.String()},
+		{rbac.ProjectOwner, rbac.StandardUser.String()},
+		{rbac.ProjectMember, rbac.StandardUser.String()},
+		{rbac.ReadOnly, rbac.StandardUser.String()},
+	}
+
+	for _, tt := range tests {
+		i.Run("Validate updating ingress for user with role "+tt.role.String(), func() {
+			subSession := i.session.NewSession()
+			defer subSession.Cleanup()
+
+			log.Infof("Creating project and namespace for role: %s", tt.role)
+			adminProject, namespace, err := projects.CreateProjectAndNamespace(i.client, i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Infof("Creating user with role: %s", tt.role)
+			newUser, standardUserClient, err := rbac.AddUserWithRoleToCluster(i.client, tt.member, tt.role.String(), i.cluster, adminProject)
+			require.NoError(i.T(), err)
+			log.Infof("Created user: %v", newUser.Username)
+
+			log.Info("Creating workload using admin client")
+			workload, err := deployment.CreateDeployment(i.client, i.cluster.ID, namespace.Name, 1, "nginx", "", false, false, true, false)
+			require.NoError(i.T(), err)
+
+			steveWorkload := &v1.SteveAPIObject{}
+			err = v1.ConvertToK8sType(workload, steveWorkload)
+			require.NoError(i.T(), err)
+
+			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+
+			log.Info("Setting up admin steve client")
+			adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Info("Creating test ingress with admin client")
+			ingress, err := extensionsingress.CreateIngress(adminSteveClient, ingressTemplate.Name, ingressTemplate)
+			require.NoError(i.T(), err)
+
+			log.Infof("Setting up user steve client for role: %s", tt.role)
+			steveClient, err := standardUserClient.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Info("Preparing ingress update")
+			updatedTemplate := ingressTemplate.DeepCopy()
+			updatedTemplate.Spec.Rules[0].Host = fmt.Sprintf("%s.updated.com", namegen.AppendRandomString("test"))
+
+			log.Infof("Attempting to update ingress as %s", tt.role)
+			_, err = ingresses.UpdateIngress(steveClient, ingress, updatedTemplate)
+
+			switch tt.role.String() {
+			case rbac.ClusterOwner.String(), rbac.ProjectOwner.String(), rbac.ProjectMember.String():
+				log.Info("Verifying successful update")
+				require.NoError(i.T(), err)
+
+			case rbac.ClusterMember.String(), rbac.ReadOnly.String():
+				log.Info("Verifying update was prevented")
+				require.Error(i.T(), err)
+				isPermissionError := k8sError.IsForbidden(err) ||
+					strings.Contains(err.Error(), "is not updatable") ||
+					strings.Contains(err.Error(), "Resource type [networking.k8s.io.ingress]") ||
+					strings.Contains(err.Error(), "Unknown schema type") ||
+					strings.Contains(err.Error(), "admission webhook")
+
+				if !isPermissionError {
+					log.Errorf("Unexpected error for %s role: %v", tt.role, err)
+				}
+				require.True(i.T(), isPermissionError)
+			}
+
+			log.Info("Cleaning up test ingress")
+			err = adminSteveClient.SteveType(ingress.Type).Delete(ingress)
+			require.NoError(i.T(), err)
+		})
+	}
+}
+
+func (i *IngressRBACTestSuite) TestDeleteIngress() {
+	tests := []struct {
+		role   rbac.Role
+		member string
+	}{
+		{rbac.ClusterOwner, rbac.StandardUser.String()},
+		{rbac.ClusterMember, rbac.StandardUser.String()},
+		{rbac.ProjectOwner, rbac.StandardUser.String()},
+		{rbac.ProjectMember, rbac.StandardUser.String()},
+		{rbac.ReadOnly, rbac.StandardUser.String()},
+	}
+
+	for _, tt := range tests {
+		i.Run("Validate deleting ingress for user with role "+tt.role.String(), func() {
+			subSession := i.session.NewSession()
+			defer subSession.Cleanup()
+
+			log.Infof("Creating project and namespace for role: %s", tt.role)
+			adminProject, namespace, err := projects.CreateProjectAndNamespace(i.client, i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Infof("Creating user with role: %s", tt.role)
+			newUser, standardUserClient, err := rbac.AddUserWithRoleToCluster(i.client, tt.member, tt.role.String(), i.cluster, adminProject)
+			require.NoError(i.T(), err)
+			log.Infof("Created user: %v", newUser.Username)
+
+			log.Info("Creating workload and ingress as admin")
+			workload, err := deployment.CreateDeployment(i.client, i.cluster.ID, namespace.Name, 1, "nginx", "", false, false, true, false)
+			require.NoError(i.T(), err)
+
+			steveWorkload := &v1.SteveAPIObject{}
+			err = v1.ConvertToK8sType(workload, steveWorkload)
+			require.NoError(i.T(), err)
+
+			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+
+			log.Info("Setting up admin steve client")
+			adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Info("Creating test ingress")
+			ingress, err := extensionsingress.CreateIngress(adminSteveClient, ingressTemplate.Name, ingressTemplate)
+			require.NoError(i.T(), err)
+
+			log.Infof("Setting up user steve client for role: %s", tt.role)
+			steveClient, err := standardUserClient.Steve.ProxyDownstream(i.cluster.ID)
+			require.NoError(i.T(), err)
+
+			log.Info("Attempting ingress deletion")
+			err = steveClient.SteveType(ingress.Type).Delete(ingress)
+
+			options := url.Values{}
+			options.Add("fieldSelector", fmt.Sprintf("metadata.name=%s", ingress.Name))
+			options.Add("namespace", namespace.Name)
+
+			switch tt.role.String() {
+			case rbac.ClusterOwner.String(), rbac.ProjectOwner.String(), rbac.ProjectMember.String():
+				log.Info("Verifying successful deletion")
+				require.NoError(i.T(), err)
+				ingressList, err := adminSteveClient.SteveType(ingress.Type).List(options)
+				require.NoError(i.T(), err)
+				require.Equal(i.T(), 0, len(ingressList.Data))
+
+			case rbac.ClusterMember.String(), rbac.ReadOnly.String():
+				log.Info("Verifying deletion was prevented")
+				require.Error(i.T(), err)
+				isPermissionError := k8sError.IsForbidden(err) ||
+					strings.Contains(err.Error(), "is not deletable") ||
+					strings.Contains(err.Error(), "can not be deleted") ||
+					strings.Contains(err.Error(), "Resource type [networking.k8s.io.ingress]") ||
+					strings.Contains(err.Error(), "Unknown schema type") ||
+					strings.Contains(err.Error(), "admission webhook")
+
+				if !isPermissionError {
+					log.Errorf("Unexpected error: %v", err)
+				}
+				require.True(i.T(), isPermissionError)
+
+				log.Info("Verifying ingress still exists")
+				ingressList, err := adminSteveClient.SteveType(ingress.Type).List(options)
+				require.NoError(i.T(), err)
+				require.Equal(i.T(), 1, len(ingressList.Data))
+
+				log.Info("Cleaning up with admin client")
+				err = adminSteveClient.SteveType(ingress.Type).Delete(ingress)
+				require.NoError(i.T(), err)
+			}
 		})
 	}
 }

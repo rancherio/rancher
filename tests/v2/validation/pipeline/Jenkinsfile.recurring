@@ -222,6 +222,7 @@ node {
                     def mainRancherConfigPath = "./${filename}"
 
                     sh "./yq e '.rancher.cleanup = true' -i ${mainRancherConfigPath}"
+                    sh "./yq e '.flags.desiredflags = InstallRancher|Short' -i ${mainRancherConfigPath}"
                     configFiles.each {
                       try {
                         def configPath = "./${patchedConfigsDir}/$it"

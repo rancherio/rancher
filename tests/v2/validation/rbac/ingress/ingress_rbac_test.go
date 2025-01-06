@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	networkingv1 "k8s.io/api/networking/v1"
+
 	"github.com/rancher/rancher/tests/v2/actions/ingresses"
 	"github.com/rancher/rancher/tests/v2/actions/projects"
 	"github.com/rancher/rancher/tests/v2/actions/rbac"
@@ -34,13 +36,13 @@ type IngressRBACTestSuite struct {
 }
 
 func (i *IngressRBACTestSuite) SetupSuite() {
-	testSession := session.NewSession()
-	i.session = testSession
+	i.session = session.NewSession()
 
-	client, err := rancher.NewClient("", testSession)
+	client, err := rancher.NewClient("", i.session)
 	require.NoError(i.T(), err)
 	i.client = client
 
+	log.Info("Getting cluster name from the config file and append cluster details in i")
 	clusterName := client.RancherConfig.ClusterName
 	require.NotEmptyf(i.T(), clusterName, "Cluster name should be set")
 
@@ -48,38 +50,14 @@ func (i *IngressRBACTestSuite) SetupSuite() {
 	require.NoError(i.T(), err)
 
 	i.cluster, err = i.client.Management.Cluster.ByID(clusterID)
-	require.NoError(i.T(), err)
+	require.NoError(i.T(), err, "Error getting cluster ID")
 }
 
 func (i *IngressRBACTestSuite) TearDownSuite() {
 	log.Info("Starting test suite cleanup")
+	i.session.Cleanup()
+	log.Info("Cleanup completed")
 
-	if i.session != nil {
-		log.Info("Cleaning up session resources")
-		i.session.Cleanup()
-	}
-
-	if i.client != nil && i.cluster != nil {
-		log.Info("Cleaning up any remaining ingresses")
-		steveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
-		if err != nil {
-			log.Errorf("Error getting steve client during cleanup: %v", err)
-			return
-		}
-
-		ingressList, err := steveClient.SteveType("networking.k8s.io.ingress").List(nil)
-		if err != nil {
-			log.Errorf("Error listing ingresses during cleanup: %v", err)
-			return
-		}
-
-		for _, ingress := range ingressList.Data {
-			if err := steveClient.SteveType(ingress.Type).Delete(&ingress); err != nil {
-				log.Errorf("Error deleting ingress %s during cleanup: %v", ingress.Name, err)
-			}
-		}
-		log.Info("Cleanup completed")
-	}
 }
 
 func (i *IngressRBACTestSuite) TestCreateIngress() {
@@ -117,7 +95,12 @@ func (i *IngressRBACTestSuite) TestCreateIngress() {
 			err = v1.ConvertToK8sType(workload, steveWorkload)
 			require.NoError(i.T(), err)
 
-			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+			pathType := networkingv1.PathTypePrefix
+			ingressPath := extensionsingress.NewIngressPathTemplate(pathType, "/", steveWorkload.Name, 80)
+
+			ingressName := namegen.AppendRandomString("test-ingress")
+			hostName := fmt.Sprintf("%s.foo.com", namegen.AppendRandomString("test"))
+			ingressTemplate := extensionsingress.NewIngressTemplate(ingressName, namespace.Name, hostName, []networkingv1.HTTPIngressPath{ingressPath})
 
 			steveClient, err := standardUserClient.Steve.ProxyDownstream(i.cluster.ID)
 			require.NoError(i.T(), err)
@@ -214,7 +197,12 @@ func (i *IngressRBACTestSuite) TestListIngress() {
 			err = v1.ConvertToK8sType(workload, steveWorkload)
 			require.NoError(i.T(), err)
 
-			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+			pathType := networkingv1.PathTypePrefix
+			ingressPath := extensionsingress.NewIngressPathTemplate(pathType, "/", steveWorkload.Name, 80)
+
+			ingressName := namegen.AppendRandomString("test-ingress")
+			hostName := fmt.Sprintf("%s.foo.com", namegen.AppendRandomString("test"))
+			ingressTemplate := extensionsingress.NewIngressTemplate(ingressName, namespace.Name, hostName, []networkingv1.HTTPIngressPath{ingressPath})
 
 			log.Info("Creating test ingress")
 			ingress, err := extensionsingress.CreateIngress(adminSteveClient, ingressTemplate.Name, ingressTemplate)
@@ -306,7 +294,12 @@ func (i *IngressRBACTestSuite) TestUpdateIngress() {
 			err = v1.ConvertToK8sType(workload, steveWorkload)
 			require.NoError(i.T(), err)
 
-			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+			pathType := networkingv1.PathTypePrefix
+			ingressPath := extensionsingress.NewIngressPathTemplate(pathType, "/", steveWorkload.Name, 80)
+
+			ingressName := namegen.AppendRandomString("test-ingress")
+			hostName := fmt.Sprintf("%s.foo.com", namegen.AppendRandomString("test"))
+			ingressTemplate := extensionsingress.NewIngressTemplate(ingressName, namespace.Name, hostName, []networkingv1.HTTPIngressPath{ingressPath})
 
 			log.Info("Setting up admin steve client")
 			adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)
@@ -388,7 +381,12 @@ func (i *IngressRBACTestSuite) TestDeleteIngress() {
 			err = v1.ConvertToK8sType(workload, steveWorkload)
 			require.NoError(i.T(), err)
 
-			ingressTemplate := createIngressTemplate(steveWorkload, namespace.Name)
+			pathType := networkingv1.PathTypePrefix
+			ingressPath := extensionsingress.NewIngressPathTemplate(pathType, "/", steveWorkload.Name, 80)
+
+			ingressName := namegen.AppendRandomString("test-ingress")
+			hostName := fmt.Sprintf("%s.foo.com", namegen.AppendRandomString("test"))
+			ingressTemplate := extensionsingress.NewIngressTemplate(ingressName, namespace.Name, hostName, []networkingv1.HTTPIngressPath{ingressPath})
 
 			log.Info("Setting up admin steve client")
 			adminSteveClient, err := i.client.Steve.ProxyDownstream(i.cluster.ID)

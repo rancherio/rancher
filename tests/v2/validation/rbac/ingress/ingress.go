@@ -392,39 +392,3 @@ func updateDeploymentWorkload(client *rancher.Client, clusterID, namespace, name
 
 	return updatedDeployObj, nil
 }
-
-// Helper method to create ingress template
-func createIngressTemplate(workload *v1.SteveAPIObject, namespace string) networkingv1.Ingress {
-	ingressName := namegen.AppendRandomString("test-ingress")
-	pathType := networkingv1.PathTypePrefix
-
-	return networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ingressName,
-			Namespace: namespace,
-		},
-		Spec: networkingv1.IngressSpec{
-			Rules: []networkingv1.IngressRule{
-				{
-					Host: fmt.Sprintf("%s.foo.com", namegen.AppendRandomString("test")),
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     "/",
-									PathType: &pathType,
-									Backend: networkingv1.IngressBackend{
-										Service: &networkingv1.IngressServiceBackend{
-											Name: workload.Name,
-											Port: networkingv1.ServiceBackendPort{Number: 80},
-										},
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}

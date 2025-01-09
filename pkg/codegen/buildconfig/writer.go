@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"go/format"
 	"io"
-	"sort"
+	"reflect"
 	"strings"
 	"text/template"
 
@@ -15,12 +15,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type buildConstantsConfig struct {
+	CspAdapterMinVersion    *string `yaml:"cspAdapterMinVersion,omitempty"`
+	DefaultShellVersion     *string `yaml:"defaultShellVersion,omitempty"`
+	FleetVersion            *string `yaml:"fleetVersion,omitempty"`
+	ProvisioningCAPIVersion *string `yaml:"provisioningCAPIVersion,omitempty"`
+	WebhookVersion          *string `yaml:"webhookVersion,omitempty"`
+}
+
 type GoConstantsWriter struct {
 	Input  io.Reader
 	Output io.Writer
 	Tmpl   *template.Template
 	buf    []byte
-	cfg    map[string]string
+	cfg    buildConstantsConfig
 }
 
 // Run loads YAML data from the pre-configured Input source, processes it, and outputs a template with formatted
@@ -59,20 +67,28 @@ func (f *GoConstantsWriter) process() error {
 	if f.Tmpl == nil {
 		return errors.New("nil template")
 	}
-	// This sorts the keys alphabetically to process the map in a fixed order.
-	keys := make([]string, 0, len(f.cfg))
-	for k := range f.cfg {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
 
 	capitalize := cases.Title(language.English, cases.NoLower)
 	var builder strings.Builder
-	for _, k := range keys {
-		v := f.cfg[k]
+	v := reflect.ValueOf(f.cfg)
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+
+		// Dereference pointers to real values and skip nil pointers
+		fieldValue := field.Interface()
+		if field.Kind() == reflect.Ptr {
+			if field.IsNil() {
+				continue
+			}
+
+			// Dereference the pointer to get the underlying value
+			fieldValue = field.Elem().Interface()
+		}
+
 		// Capitalize the key to make the constant exported in the generated Go file.
-		k = capitalize.String(k)
-		s := fmt.Sprintf("\t%s = %q\n", k, v)
+		fieldName := v.Type().Field(i).Name
+		fieldName = capitalize.String(fieldName)
+		s := fmt.Sprintf("\t%s = %q\n", fieldName, fieldValue)
 		builder.WriteString(s)
 	}
 

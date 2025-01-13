@@ -155,6 +155,28 @@ func NewSubscriptionServiceClient(cap *Capabilities) (*armsubscription.Subscript
 	return clientFactory.NewSubscriptionsClient(), nil
 }
 
+func NewSubscriptionServiceNewClient(cap *Capabilities) (*armsubscriptions.Client, error) {
+	cloud, _ := GetEnvironment(cap.Environment)
+
+	cred, err := NewClientSecretCredential(cap)
+	if err != nil {
+		return nil, err
+	}
+
+	options := &arm.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Cloud: cloud,
+		},
+	}
+
+	clientFactory, err := armsubscription.NewClientFactory(cred, options)
+	if err != nil {
+		return nil, err
+	}
+
+	return clientFactory.NewClient(), nil
+}
+
 type sortableVersion []string
 
 func (s sortableVersion) Len() int {
@@ -527,6 +549,44 @@ func listLocations(ctx context.Context, cap *Capabilities) ([]byte, int, error) 
 	}
 
 	return encodeOutput(locations)
+}
+
+type regionsResponseBody struct {
+	Name              string   `json:"name"`
+	DisplayName       string   `json:"displayName"`
+	AvailabilityZones bool     `json:"availabilityZones"`
+}
+
+func listRegions(ctx context.Context, cap *Capabilities) ([]byte, int, error) {
+	client, err := NewSubscriptionNewClient(cap)
+	if err != nil {
+		return nil, http.StatusInternalServerError, err
+	}
+
+	var regions []redionsResponseBody
+	pager := client.NewListLocationsPager(cap.SubscriptionID, &armsubscriptions.ClientListLocationsOptions{IncludeExtendedLocations: nil})
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, http.StatusBadRequest, fmt.Errorf("failed to get regions: %w", err)
+		}
+
+		for _, v := range page.Value {
+			region = regionsResponseBody{
+				Name:        to.String(v.Name),
+				DisplayName: to.String(v.DisplayName)
+				AvailabilityZones: false
+			}
+
+			if len(v.AvailabilityZoneMappings) > 0 {
+				region.AvailabilityZones = true
+			}
+
+			regions = append(regions, region)
+		}
+	}
+
+	return encodeOutput(regions)
 }
 
 func encodeOutput(result interface{}) ([]byte, int, error) {

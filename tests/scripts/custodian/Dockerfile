@@ -1,4 +1,4 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 WORKDIR /usr/app/src
 
 ARG AWS_ACCESS_KEY_ID
@@ -38,7 +38,7 @@ RUN curl -sL https://aka.ms/InstallAzureCLIDeb | bash
 
 RUN python3 -m venv custodian-venv
 RUN . custodian-venv/bin/activate
-RUN pip3 install c7n c7n_azure c7n_gcp c7n_mailer
+RUN pip3 install c7n c7n_azure c7n_gcp c7n_mailer --break-system-packages
 
 RUN az login -u ${AZURE_CLIENT_ID} --service-principal -p ${AZURE_CLIENT_SECRET} --tenant ${AZURE_TENANT_ID} > /dev/null
 RUN gcloud auth activate-service-account --key-file $GOOGLE_APPLICATION_CREDENTIALS > /dev/null

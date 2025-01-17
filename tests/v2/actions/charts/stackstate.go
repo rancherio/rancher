@@ -5,10 +5,12 @@ import (
 	"fmt"
 
 	catalogv1 "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
+	rv1 "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
 	kubenamespaces "github.com/rancher/rancher/tests/v2/actions/kubeapi/namespaces"
 	"github.com/rancher/rancher/tests/v2/actions/namespaces"
 	"github.com/rancher/rancher/tests/v2/actions/observability"
 	"github.com/rancher/shepherd/clients/rancher"
+	"github.com/rancher/shepherd/clients/rancher/catalog"
 	"github.com/rancher/shepherd/extensions/defaults"
 	"github.com/rancher/shepherd/pkg/api/steve/catalog/types"
 	"github.com/rancher/shepherd/pkg/wait"
@@ -26,11 +28,69 @@ const (
 	StackstateNamespace          = "stackstate"
 	StackstateCRD                = "observability.rancher.io.configuration"
 	RancherPartnerChartRepo      = "rancher-partner-charts"
+	StackStateChartRepo          = "suse-observability"
 )
 
 var (
 	timeoutSeconds = int64(defaults.TwoMinuteTimeout)
 )
+
+func InstallStackStateChart(client *rancher.Client, installOptions *InstallOptions, stackstateConfigs *observability.StackStateConfig, systemProjectID string, additionalValues map[string]interface{}) error {
+
+	// Get server URL for chart configuration
+	serverSetting, err := client.Management.Setting.ByID(serverURLSettingID)
+	if err != nil {
+		log.Info("Error getting server setting.")
+		return err
+	}
+
+	// Create payload options
+	stackstateChartInstallActionPayload := &payloadOpts{
+		InstallOptions: *installOptions,
+		Name:           StackStateChartRepo,
+		Namespace:      StackstateNamespace,
+		Host:           serverSetting.Value,
+	}
+
+	chartInstallAction := newStackStateChartInstallAction(stackstateChartInstallActionPayload, stackstateConfigs, systemProjectID, additionalValues)
+
+	catalogClient, err := client.GetClusterCatalogClient(installOptions.Cluster.ID)
+	if err != nil {
+		log.Info("Error getting catalogClient")
+		return err
+	}
+
+	err = catalogClient.InstallChart(chartInstallAction, StackStateChartRepo)
+	if err != nil {
+		log.Info("Error installing the StackState chart")
+		return err
+	}
+
+	watchAppInterface, err := catalogClient.Apps(StackstateNamespace).Watch(context.TODO(), metav1.ListOptions{
+		FieldSelector:  "metadata.name=" + "suse-observability",
+		TimeoutSeconds: &defaults.WatchTimeoutSeconds,
+	})
+	if err != nil {
+		log.Info("StackState App failed to install")
+		return err
+	}
+
+	err = wait.WatchWait(watchAppInterface, func(event watch.Event) (ready bool, err error) {
+		app := event.Object.(*catalogv1.App)
+
+		state := app.Status.Summary.State
+		if state == string(catalogv1.StatusDeployed) {
+			return true, nil
+		}
+		return false, nil
+	})
+
+	if err != nil {
+		log.Info("Unable to obtain the status of the installed app ")
+		return err
+	}
+	return nil
+}
 
 // InstallStackstateAgentChart is a private helper function that returns chart install action with stack state agent and payload options.
 func InstallStackstateAgentChart(client *rancher.Client, installOptions *InstallOptions, stackstateConfigs *observability.StackStateConfig, systemProjectID string) error {
@@ -184,6 +244,28 @@ func newStackstateAgentChartInstallAction(p *payloadOpts, stackstateConfigs *obs
 	return chartInstallAction
 }
 
+func newStackStateChartInstallAction(p *payloadOpts, stackstateConfigs *observability.StackStateConfig, systemProjectID string, additionalValues map[string]interface{}) *types.ChartInstallAction {
+	stackstatechartValues := map[string]interface{}{
+		"stackstate": map[string]interface{}{
+			"cluster": map[string]interface{}{
+				"name": p.Cluster.Name,
+			},
+			"apiKey": stackstateConfigs.ClusterApiKey,
+			"url":    stackstateConfigs.Url,
+		},
+	}
+
+	// Merge with additional values
+	mergedValues := mergeValues(stackstatechartValues, additionalValues)
+
+	chartInstall := newChartInstall(p.Name, p.Version, p.Cluster.ID, p.Cluster.Name, p.Host, stackStateChart, systemProjectID, p.DefaultRegistry, mergedValues)
+
+	chartInstalls := []types.ChartInstall{*chartInstall}
+	chartInstallAction := newChartInstallAction(p.Namespace, p.ProjectID, chartInstalls)
+
+	return chartInstallAction
+}
+
 // UpgradeStackstateAgentChart is a helper function that upgrades the stackstate agent chart.
 func UpgradeStackstateAgentChart(client *rancher.Client, installOptions *InstallOptions, stackstateConfigs *observability.StackStateConfig, systemProjectID string) error {
 	serverSetting, err := client.Management.Setting.ByID(serverURLSettingID)
@@ -284,4 +366,52 @@ func newStackstateAgentChartUpgradeAction(p *payloadOpts, stackstateConfigs *obs
 	chartUpgradeAction := newChartUpgradeAction(p.Namespace, chartUpgrades)
 
 	return chartUpgradeAction
+}
+
+// CreateClusterRepo creates a new ClusterRepo resource in the Kubernetes cluster using the provided catalog client.
+// It takes the client, repository name, and repository URL as arguments and returns an error if the operation fails.
+func CreateClusterRepo(client *rancher.Client, catalogClient *catalog.Client, name, url string) error {
+	ctx := context.Background()
+	repo := buildClusterRepo(name, url)
+	_, err := catalogClient.ClusterRepos().Create(ctx, repo, metav1.CreateOptions{})
+
+	client.Session.RegisterCleanupFunc(func() error {
+
+		var propagation = metav1.DeletePropagationForeground
+		err := catalogClient.ClusterRepos().Delete(context.Background(), "suse-observability", metav1.DeleteOptions{PropagationPolicy: &propagation})
+		if err != nil {
+			return err
+		}
+
+		return err
+	})
+	return err
+}
+
+// buildClusterRepo creates and returns a new ClusterRepo object with the provided name and URL.
+func buildClusterRepo(name, url string) *rv1.ClusterRepo {
+	return &rv1.ClusterRepo{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       rv1.RepoSpec{URL: url},
+	}
+}
+
+// mergeValues merges multiple YAML values maps into a single map
+func mergeValues(values ...map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{})
+	for _, v := range values {
+		for key, value := range v {
+			if existingValue, ok := result[key]; ok {
+				if existingMap, ok := existingValue.(map[string]interface{}); ok {
+					if newMap, ok := value.(map[string]interface{}); ok {
+						// Recursively merge maps
+						result[key] = mergeValues(existingMap, newMap)
+						continue
+					}
+				}
+			}
+			result[key] = value
+		}
+	}
+	return result
 }

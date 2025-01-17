@@ -13,12 +13,14 @@ node {
     def setupContainer = "${job_name}${env.BUILD_NUMBER}_setup"
     def configGeneratorContainer = "${job_name}${env.BUILD_NUMBER}_generator"
     def cleanupContainer = "${job_name}${env.BUILD_NUMBER}_cleanup"
+  
 
     def imageName = "rancher-validation-${job_name}${env.BUILD_NUMBER}"
 
     def testsDir = "github.com/rancher/rancher/tests/v2/validation/"
     def upgradeTestsDir = "${testsDir}upgrade"
     def provisioningTestsDir = "${testsDir}provisioning"
+    def testRancherVersions = "testrancherk8s.yaml"
 
     def groovyEnvironments = "environments.groovy" 
     def configsDir = "cattle-configs"
@@ -52,6 +54,7 @@ node {
               paramsMap << "$it.key=$it.value"
           }
         }
+        
         withCredentials([ string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'AWS_ACCESS_KEY_ID'),
                           string(credentialsId: 'AWS_SECRET_ACCESS_KEY', variable: 'AWS_SECRET_ACCESS_KEY'),
                           string(credentialsId: 'AWS_ACCESS_KEY_ID', variable: 'RANCHER_EKS_ACCESS_KEY'),
@@ -130,6 +133,7 @@ node {
                 sh "./tests/v2/validation/build.sh"
               }
               stage('Setup') {
+
                 sh returnStdout: true, script: 'wget -qO ./yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64'
                 sh returnStdout:true, script: 'chmod a+x ./yq'
 
@@ -237,6 +241,74 @@ node {
                     env.HA_CLEANUP=true
                 }
                 println "HA cleanup: ${env.HA_CLEANUP}"
+                
+                
+                echo "Here's the directory and its contents"
+                sh "ls -lR"
+                sh "pwd"
+                
+                
+                sh "docker run --name ${setupContainer} -t " +
+                  "${imageName} sh -c \"${workPath}pipeline/scripts/rancher_k8s_version.sh\""
+
+
+                script {
+                    println "The testRancherVersions file being used is: ${testRancherVersions}"
+                }
+
+                sh "ls -lR"
+                sh "pwd"
+                
+
+                  rancherImageTag = sh(
+                      script: "./yq '.RANCHER_IMAGE_TAG'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                  rancherVersion = sh(
+                      script: "./yq '.RANCHER_VERSION'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+                  
+                  rancherRke2Version = sh(
+                      script: "./yq '.RANCHER_RKE2_VERSION'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                   rancherRke2VersionToUpgrade = sh(
+                      script: "./yq '.RANCHER_RKE2_VERSION_TO_UPGRADE'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                  rancherK3sVersion = sh(
+                      script: "./yq '.RANCHER_K3S_VERSION'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                  rancherK3sVersionToUpgrade = sh(
+                      script: "./yq '.RANCHER_K3S_VERSION_TO_UPGRADE'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                  rancherRke1Version = sh(
+                      script: "./yq '.RANCHER_RKE1_VERSION'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                  rancherRke1VersionToUpgrade = sh(
+                      script: "./yq '.RANCHER_RKE1_VERSION_TO_UPGRADE'  ./${testRancherVersions}",
+                      returnStdout: true
+                    ).trim()
+
+                  config = config.replace('${RANCHER_VERSION}', rancherVersion)
+                  config = config.replace('${RANCHER_IMAGE_TAG}', rancherImageTag)
+                  config = config.replace('${RANCHER_RKE2_VERSION}', preUpgradeRKE2K8s)
+                  config = config.replace('${RANCHER_RKE2_VERSION_TO_UPGRADE}', postUpgradeRKE2K8s)
+                  config = config.replace('${RANCHER_K3S_VERSION}', preUpgradeK3sK8s)
+                  config = config.replace('${RANCHER_K3S_VERSION_TO_UPGRADE}', postUpgradeK3sK8s)
+                  config = config.replace('${RANCHER_RKE1_VERSION}', preUpgradeRKE1K8s)
+                  config = config.replace('${RANCHER_RKE1_VERSION_TO_UPGRADE}', postUpgradeRKE1K8s)
+
               }
               stage('Deploys Rancher on a specified version') {
                 deployParams = [

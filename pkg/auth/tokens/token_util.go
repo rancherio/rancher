@@ -62,11 +62,11 @@ func IsExpired(token v3.Token) bool {
 // IsIdleExpired checks if the idle session timeout was reached since last update.
 func IsIdleExpired(token v3.Token, lastTimeActivity time.Time) bool {
 	// useractivity has not been initialized yet
-	if token.CurrentIdleTimeout.IsZero() {
+	if token.LastIdleTimeout.IsZero() {
 		return false
 	}
 
-	return token.CurrentIdleTimeout.Before(lastTimeActivity)
+	return token.LastIdleTimeout.Before(lastTimeActivity)
 }
 
 func GetTokenAuthFromRequest(req *http.Request) string {

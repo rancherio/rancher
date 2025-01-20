@@ -59,6 +59,16 @@ func IsExpired(token v3.Token) bool {
 	return durationElapsed.Seconds() >= ttlDuration.Seconds()
 }
 
+// IsIdleExpired checks if the idle session timeout was reached since last update.
+func IsIdleExpired(token v3.Token, lastTimeActivity time.Time) bool {
+	// useractivity has not been initialized yet
+	if token.LastIdleTimeout.IsZero() {
+		return false
+	}
+
+	return token.LastIdleTimeout.Before(lastTimeActivity)
+}
+
 func GetTokenAuthFromRequest(req *http.Request) string {
 	var tokenAuthValue string
 	authHeader := req.Header.Get(AuthHeaderName)
@@ -153,6 +163,11 @@ func VerifyToken(storedToken *v3.Token, tokenName, tokenKey string) (int, error)
 	}
 	if IsExpired(*storedToken) {
 		return http.StatusGone, errors.New("must authenticate")
+	}
+
+	currentTime := time.Now()
+	if IsIdleExpired(*storedToken, currentTime) {
+		return http.StatusGone, errors.New("must authenticate, idle session timeout expired")
 	}
 	return http.StatusOK, nil
 }
